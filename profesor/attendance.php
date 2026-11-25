@@ -1,249 +1,207 @@
 <?php
 declare(strict_types=1);
+
 require_once __DIR__ . '/../config/db.php';
 require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/layout.php';
 
 requireRole('profesor');
 $user = currentUser();
-$pdo = getDB();
+$db = getDB();
 
-$courseId = (int)($_GET['course_id'] ?? $_POST['course_id'] ?? 0);
-$stmt = $pdo->prepare('SELECT * FROM courses WHERE id = ? AND professor_id = ? LIMIT 1');
-$stmt->execute([$courseId, $user['id']]);
-$course = $stmt->fetch();
-if (!$course) {
-    header('Location: /sgap/profesor/courses.php');
+$errorMsg = '';
+$successMsg = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start_class') {
+    $courseId = (int)($_POST['course_id'] ?? 0);
+    $cStmt = $db->prepare('SELECT id FROM courses WHERE id = ? AND professor_id = ?');
+    $cStmt->execute([$courseId, $user['id']]);
+    if (!$cStmt->fetch()) {
+        $errorMsg = 'No tienes permiso para realizar esta acción';
+    } else {
+        $openStmt = $db->prepare('SELECT id FROM attendance_sessions WHERE course_id = ? AND status = "abierta" LIMIT 1');
+        $openStmt->execute([$courseId]);
+        if ($openStmt->fetch()) {
+            $errorMsg = 'Ya existe una clase abierta';
+        } else {
+            $token = bin2hex(random_bytes(16));
+            $now = date('Y-m-d H:i:s');
+            $expires = date('Y-m-d H:i:s', time() + 600); // 10 minutos
+
+            $db->beginTransaction();
+            try {
+                $ins = $db->prepare('INSERT INTO attendance_sessions (course_id, started_at, status, qr_token, qr_expires_at) VALUES (?, ?, "abierta", ?, ?)');
+                $ins->execute([$courseId, $now, $token, $expires]);
+                $newSessionId = (int)$db->lastInsertId();
+
+                // Fijar lista de inscritos al iniciar en estado Pendiente
+                $recIns = $db->prepare('
+                    INSERT INTO attendance_records (session_id, student_id, status, participation_count)
+                    SELECT ?, student_id, "Pendiente", 0 FROM enrollments WHERE course_id = ?
+                ');
+                $recIns->execute([$newSessionId, $courseId]);
+                $db->commit();
+
+                header('Location: /sgap/profesor/attendance.php?session_id=' . $newSessionId);
+                exit;
+            } catch (Throwable $e) {
+                $db->rollBack();
+                $errorMsg = 'No fue posible guardar los cambios. Intenta nuevamente';
+            }
+        }
+    }
+}
+
+$sessionId = isset($_GET['session_id']) ? (int)$_GET['session_id'] : (int)($_POST['session_id'] ?? 0);
+
+$sStmt = $db->prepare('
+    SELECT s.*, c.name AS course_name, c.group_name, c.professor_id
+    FROM attendance_sessions s
+    JOIN courses c ON c.id = s.course_id
+    WHERE s.id = ? AND c.professor_id = ?
+');
+$sStmt->execute([$sessionId, $user['id']]);
+$session = $sStmt->fetch();
+
+if (!$session) {
+    renderHeader('Clase activa', 'cursos');
+    echo '<div class="card"><div class="alert alert-error">' . e($errorMsg !== '' ? $errorMsg : 'No tienes permiso para realizar esta acción') . '</div><a href="/sgap/profesor/courses.php" class="btn btn-primary">Volver a Mis cursos</a></div>';
+    renderFooter();
     exit;
 }
 
-$sessionDate = $_GET['date'] ?? $_POST['session_date'] ?? date('Y-m-d');
-$success = '';
-$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $postAction = $_POST['action'] ?? '';
+    if ($postAction === 'save_manual') {
+        $statuses = $_POST['status'] ?? [];
+        $upd = $db->prepare('UPDATE attendance_records SET status = ? WHERE session_id = ? AND student_id = ?');
+        foreach ($statuses as $stId => $stVal) {
+            if (in_array($stVal, ['Presente', 'Ausente'], true)) {
+                $upd->execute([$stVal, $sessionId, (int)$stId]);
+            }
+        }
+        $successMsg = 'Asistencia registrada';
+    } elseif ($postAction === 'close_class' && $session['status'] === 'abierta') {
+        $db->beginTransaction();
+        try {
+            $db->prepare('UPDATE attendance_sessions SET status = "cerrada", closed_at = ?, qr_token = NULL WHERE id = ?')
+               ->execute([date('Y-m-d H:i:s'), $sessionId]);
+            $db->prepare('UPDATE attendance_records SET status = "Ausente" WHERE session_id = ? AND status = "Pendiente"')
+               ->execute([$sessionId]);
+            $db->commit();
+            $sStmt->execute([$sessionId, $user['id']]);
+            $session = $sStmt->fetch();
+            $successMsg = 'La clase ha finalizado y los pendientes se marcaron como Ausente.';
+        } catch (Throwable $e) {
+            $db->rollBack();
+            $errorMsg = 'No fue posible guardar los cambios. Intenta nuevamente';
+        }
+    }
+}
 
-// Estudiantes inscritos
-$stuStmt = $pdo->prepare('
-    SELECT u.id, u.full_name, u.email
-    FROM enrollments e
-    JOIN users u ON u.id = e.student_id
-    WHERE e.course_id = ?
+$recStmt = $db->prepare('
+    SELECT r.student_id, r.status, u.full_name, u.control_number
+    FROM attendance_records r
+    JOIN users u ON u.id = r.student_id
+    WHERE r.session_id = ?
     ORDER BY u.full_name ASC
 ');
-$stuStmt->execute([$courseId]);
-$students = $stuStmt->fetchAll();
+$recStmt->execute([$sessionId]);
+$records = $recStmt->fetchAll();
 
-// Obtener o crear sesión según acción
-$sessStmt = $pdo->prepare('SELECT * FROM attendance_sessions WHERE course_id = ? AND session_date = ? LIMIT 1');
-$sessStmt->execute([$courseId, $sessionDate]);
-$session = $sessStmt->fetch();
+$isOpen = $session['status'] === 'abierta';
+$qrValid = $isOpen && $session['qr_token'] !== null && strtotime($session['qr_expires_at']) > time();
+$qrUrl = 'http://' . ($_SERVER['HTTP_HOST'] ?? 'localhost:8000') . '/sgap/qr_checkin.php?token=' . urlencode((string)$session['qr_token']);
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-
-    if (empty($students)) {
-        $error = 'No hay estudiantes inscritos en este curso.';
-    } elseif ($action === 'save_manual') {
-        $statuses = $_POST['status'] ?? [];
-        $validStatuses = ['Presente', 'Falta', 'Retardo'];
-        $allValid = true;
-        foreach ($students as $s) {
-            $st = $statuses[$s['id']] ?? '';
-            if (!in_array($st, $validStatuses, true)) {
-                $allValid = false;
-                break;
-            }
-        }
-        if (!$allValid) {
-            $error = 'Todos los estudiantes inscritos deben tener un estado válido seleccionado.';
-        } else {
-            $pdo->beginTransaction();
-            try {
-                if (!$session) {
-                    $insSess = $pdo->prepare('INSERT INTO attendance_sessions (course_id, session_date) VALUES (?, ?)');
-                    $insSess->execute([$courseId, $sessionDate]);
-                    $sessionId = (int)$pdo->lastInsertId();
-                } else {
-                    $sessionId = (int)$session['id'];
-                }
-                $upsert = $pdo->prepare('
-                    INSERT INTO attendance_records (session_id, student_id, status)
-                    VALUES (?, ?, ?)
-                    ON DUPLICATE KEY UPDATE status = VALUES(status)
-                ');
-                foreach ($students as $s) {
-                    $upsert->execute([$sessionId, $s['id'], $statuses[$s['id']]]);
-                }
-                $pdo->commit();
-                $success = 'Asistencia guardada correctamente para el ' . $sessionDate . '.';
-                $sessStmt->execute([$courseId, $sessionDate]);
-                $session = $sessStmt->fetch();
-            } catch (Throwable $ex) {
-                $pdo->rollBack();
-                $error = 'Error al guardar la asistencia.';
-            }
-        }
-    } elseif ($action === 'start_qr') {
-        $token = bin2hex(random_bytes(16));
-        $pdo->beginTransaction();
-        try {
-            if (!$session) {
-                $insSess = $pdo->prepare('INSERT INTO attendance_sessions (course_id, session_date, qr_token, is_qr_open) VALUES (?, ?, ?, 1)');
-                $insSess->execute([$courseId, $sessionDate, $token]);
-                $sessionId = (int)$pdo->lastInsertId();
-            } else {
-                $sessionId = (int)$session['id'];
-                $updSess = $pdo->prepare('UPDATE attendance_sessions SET qr_token = COALESCE(qr_token, ?), is_qr_open = 1 WHERE id = ?');
-                $updSess->execute([$token, $sessionId]);
-            }
-            // Inicializar todos con Falta por defecto si no tienen registro
-            $insRec = $pdo->prepare('INSERT IGNORE INTO attendance_records (session_id, student_id, status) VALUES (?, ?, "Falta")');
-            foreach ($students as $s) {
-                $insRec->execute([$sessionId, $s['id']]);
-            }
-            $pdo->commit();
-            $success = 'Sesión QR iniciada. Los estudiantes ya pueden escanear el código.';
-            $sessStmt->execute([$courseId, $sessionDate]);
-            $session = $sessStmt->fetch();
-        } catch (Throwable $ex) {
-            $pdo->rollBack();
-            $error = 'Error al iniciar la sesión QR.';
-        }
-    } elseif ($action === 'close_qr' && $session) {
-        $upd = $pdo->prepare('UPDATE attendance_sessions SET is_qr_open = 0 WHERE id = ?');
-        $upd->execute([$session['id']]);
-        $success = 'Sesión QR cerrada. Ahora puedes ajustar manualmente cualquier estado si lo necesitas.';
-        $sessStmt->execute([$courseId, $sessionDate]);
-        $session = $sessStmt->fetch();
-    }
-}
-
-$recordsMap = [];
-if ($session) {
-    $recStmt = $pdo->prepare('SELECT student_id, status FROM attendance_records WHERE session_id = ?');
-    $recStmt->execute([$session['id']]);
-    foreach ($recStmt->fetchAll() as $r) {
-        $recordsMap[(int)$r['student_id']] = $r['status'];
-    }
-}
-
-$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-$host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-$qrUrl = ($session && !empty($session['qr_token']))
-    ? $scheme . '://' . $host . '/sgap/qr_checkin.php?token=' . $session['qr_token']
-    : '';
+renderHeader($isOpen ? 'Clase activa' : 'Sesión cerrada', 'cursos');
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Asistencia - SGAP</title>
-  <link rel="stylesheet" href="/sgap/assets/css/style.css">
-</head>
-<body>
-  <nav class="navbar">
-    <div class="brand">SGAP · Profesor</div>
-    <div class="nav-links">
-      <a href="/sgap/profesor/dashboard.php">Dashboard</a>
-      <a href="/sgap/profesor/courses.php">Cursos</a>
-      <a href="/sgap/logout.php" class="btn btn-secondary btn-sm">Cerrar sesión</a>
-    </div>
-  </nav>
+<h1><?= e($session['course_name']) ?> (<?= e($session['group_name']) ?>) — <?= $isOpen ? 'Clase activa' : 'Sesión cerrada' ?></h1>
+<p style="margin-bottom:16px;"><strong>Inicio:</strong> <?= date('d/m/Y H:i', strtotime($session['started_at'])) ?></p>
 
-  <div class="container">
-    <div class="card-header">
-      <h1>Asistencia: <?= e($course['name']) ?> (<?= e($course['code']) ?>)</h1>
-      <a href="/sgap/profesor/courses.php" class="btn btn-secondary btn-sm">Volver a cursos</a>
-    </div>
+<?php if ($successMsg !== ''): ?>
+  <div class="alert alert-success"><?= e($successMsg) ?></div>
+<?php endif; ?>
+<?php if ($errorMsg !== ''): ?>
+  <div class="alert alert-error"><?= e($errorMsg) ?></div>
+<?php endif; ?>
 
-    <?php if ($error !== ''): ?><div class="alert alert-danger"><?= e($error) ?></div><?php endif; ?>
-    <?php if ($success !== ''): ?><div class="alert alert-success"><?= e($success) ?></div><?php endif; ?>
-
-    <div class="card">
-      <form method="GET" class="actions-row">
-        <input type="hidden" name="course_id" value="<?= $courseId ?>">
-        <label for="date"><strong>Fecha de sesión:</strong></label>
-        <input type="date" id="date" name="date" value="<?= e($sessionDate) ?>" class="form-control" style="max-width:180px;">
-        <button type="submit" class="btn btn-secondary btn-sm">Cargar fecha</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <h2>Asistencia por Código QR (RF-09)</h2>
-        <?php if (!$session || !$session['is_qr_open']): ?>
-          <form method="POST">
-            <input type="hidden" name="action" value="start_qr">
-            <input type="hidden" name="course_id" value="<?= $courseId ?>">
-            <input type="hidden" name="session_date" value="<?= e($sessionDate) ?>">
-            <button type="submit" class="btn btn-primary btn-sm">Iniciar sesión QR</button>
-          </form>
-        <?php else: ?>
-          <form method="POST">
-            <input type="hidden" name="action" value="close_qr">
-            <input type="hidden" name="course_id" value="<?= $courseId ?>">
-            <input type="hidden" name="session_date" value="<?= e($sessionDate) ?>">
-            <button type="submit" class="btn btn-danger btn-sm">Cerrar sesión QR</button>
-          </form>
-        <?php endif; ?>
-      </div>
-
-      <?php if ($session && $session['is_qr_open'] && $qrUrl !== ''): ?>
-        <div class="qr-box">
-          <p><strong>Sesión QR Activa</strong> — Escanea este código para registrar tu asistencia:</p>
-          <div id="qrcode" style="margin:1rem auto; display:inline-block; background:#fff; padding:10px; border-radius:8px;"></div>
-          <p class="muted" style="word-break:break-all; font-size:0.82rem;">URL: <a href="<?= e($qrUrl) ?>" target="_blank"><?= e($qrUrl) ?></a></p>
-        </div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-        <script>
-          if (typeof QRCode !== 'undefined') {
-            new QRCode(document.getElementById('qrcode'), { text: <?= json_encode($qrUrl) ?>, width: 180, height: 180 });
-          } else {
-            document.getElementById('qrcode').innerHTML = '<p class="muted">Usa el enlace de abajo para registrar asistencia.</p>';
-          }
-        </script>
-      <?php elseif ($session && !$session['is_qr_open'] && $qrUrl !== ''): ?>
-        <p class="muted">La sesión QR para esta fecha está cerrada.</p>
-      <?php else: ?>
-        <p class="muted">Inicia una sesión QR para generar el código único de esta fecha.</p>
-      <?php endif; ?>
-    </div>
-
-    <div class="card">
-      <h2>Pase de Lista Manual (RF-08)</h2>
-      <?php if (empty($students)): ?>
-        <p class="muted">No hay estudiantes inscritos en este curso.</p>
-      <?php else: ?>
-        <form method="POST">
-          <input type="hidden" name="action" value="save_manual">
-          <input type="hidden" name="course_id" value="<?= $courseId ?>">
-          <input type="hidden" name="session_date" value="<?= e($sessionDate) ?>">
-          <table>
-            <thead>
-              <tr><th>Estudiante</th><th>Correo</th><th>Estado</th></tr>
-            </thead>
-            <tbody>
-              <?php foreach ($students as $s): $curr = $recordsMap[(int)$s['id']] ?? ''; ?>
-                <tr>
-                  <td><?= e($s['full_name']) ?></td>
-                  <td><?= e($s['email']) ?></td>
-                  <td>
-                    <select name="status[<?= (int)$s['id'] ?>]" class="form-control" style="max-width:160px;" required>
-                      <option value="">-- Seleccionar --</option>
-                      <option value="Presente" <?= $curr === 'Presente' ? 'selected' : '' ?>>Presente</option>
-                      <option value="Falta" <?= $curr === 'Falta' ? 'selected' : '' ?>>Falta</option>
-                      <option value="Retardo" <?= $curr === 'Retardo' ? 'selected' : '' ?>>Retardo</option>
-                    </select>
-                  </td>
-                </tr>
-              <?php endforeach; ?>
-            </tbody>
-          </table>
-          <div style="margin-top:1rem;">
-            <button type="submit" class="btn btn-success">Guardar asistencia</button>
-          </div>
-        </form>
-      <?php endif; ?>
-    </div>
+<div class="card" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+  <div style="display:flex; gap:10px; flex-wrap:wrap;">
+    <a href="/sgap/profesor/participation.php?session_id=<?= $sessionId ?>" class="btn btn-primary">Registro de participación</a>
+    <a href="/sgap/profesor/enrollments.php?course_id=<?= (int)$session['course_id'] ?>" class="btn btn-secondary">Volver al curso</a>
   </div>
-</body>
-</html>
+  <?php if ($isOpen): ?>
+    <form method="POST" action="/sgap/profesor/attendance.php?session_id=<?= $sessionId ?>" onsubmit="return confirm('¿Finalizar clase? Se desactivará el QR y los estudiantes pendientes pasarán a Ausente.');" style="margin:0;">
+      <input type="hidden" name="action" value="close_class">
+      <input type="hidden" name="session_id" value="<?= $sessionId ?>">
+      <button type="submit" class="btn btn-danger">Finalizar clase</button>
+    </form>
+  <?php endif; ?>
+</div>
+
+<?php if ($isOpen): ?>
+  <div class="card">
+    <h2>Código QR de asistencia</h2>
+    <?php if ($qrValid): ?>
+      <p><strong>Vigencia hasta:</strong> <?= date('d/m/Y H:i', strtotime($session['qr_expires_at'])) ?> (10 minutos)</p>
+      <div style="margin:12px 0;">
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=<?= urlencode($qrUrl) ?>" alt="Código QR de asistencia" width="180" height="180" style="border:1px solid #D1D5DB; border-radius:8px; padding:6px; background:#fff;">
+      </div>
+      <p style="font-size:14px; word-break:break-all;"><strong>Enlace QR:</strong> <a href="<?= e($qrUrl) ?>"><?= e($qrUrl) ?></a></p>
+    <?php else: ?>
+      <div class="alert alert-error">QR vencido o inválido. Usa el registro manual.</div>
+    <?php endif; ?>
+  </div>
+<?php endif; ?>
+
+<div class="card">
+  <h2>Lista de asistencia <?= $isOpen ? '(Registro manual)' : '(Corrección posterior)' ?></h2>
+  <?php if (empty($records)): ?>
+    <div class="alert alert-info">Sin registros.</div>
+  <?php else: ?>
+    <form method="POST" action="/sgap/profesor/attendance.php?session_id=<?= $sessionId ?>">
+      <input type="hidden" name="action" value="save_manual">
+      <input type="hidden" name="session_id" value="<?= $sessionId ?>">
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Número de control</th>
+              <th>Nombre</th>
+              <th>Estado actual</th>
+              <th>Marcar</th>
+            </tr>
+          </thead>
+          <tbody>
+            <?php foreach ($records as $r): ?>
+              <tr>
+                <td><?= e($r['control_number']) ?></td>
+                <td><?= e($r['full_name']) ?></td>
+                <td>
+                  <?php if ($r['status'] === 'Presente'): ?>
+                    <span class="badge badge-presente">✓ Presente</span>
+                  <?php elseif ($r['status'] === 'Ausente'): ?>
+                    <span class="badge badge-ausente">✕ Ausente</span>
+                  <?php else: ?>
+                    <span class="badge badge-pendiente">• Pendiente</span>
+                  <?php endif; ?>
+                </td>
+                <td>
+                  <select name="status[<?= (int)$r['student_id'] ?>]" style="min-width:140px;">
+                    <option value="">-- Sin cambio --</option>
+                    <option value="Presente" <?= $r['status'] === 'Presente' ? 'selected' : '' ?>>Presente</option>
+                    <option value="Ausente" <?= $r['status'] === 'Ausente' ? 'selected' : '' ?>>Ausente</option>
+                  </select>
+                </td>
+              </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top:16px;">
+        <button type="submit" class="btn btn-primary">Guardar</button>
+      </div>
+    </form>
+  <?php endif; ?>
+</div>
+<?php renderFooter(); ?>

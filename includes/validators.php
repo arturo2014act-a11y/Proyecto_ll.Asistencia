@@ -3,59 +3,74 @@ declare(strict_types=1);
 
 function validateFullName(string $name): ?string {
     $name = trim($name);
-    $len = mb_strlen($name, 'UTF-8');
-    if ($len < 3 || $len > 80) {
-        return 'El nombre completo debe tener entre 3 y 80 caracteres.';
+    if ($name === '') {
+        return 'Este campo es obligatorio';
     }
-    if (!preg_match('/^[\p{L}\s]+$/u', $name)) {
-        return 'El nombre completo solo puede contener letras y espacios.';
+    $len = mb_strlen($name, 'UTF-8');
+    if ($len > 80) {
+        return 'Se superó el máximo de caracteres';
+    }
+    if ($len < 2 || !preg_match("/^[\p{L}\s\-']+$/u", $name)) {
+        return 'Debe tener entre 2 y 80 caracteres (letras, acentos, espacios, guion y apóstrofo).';
     }
     return null;
 }
 
 function validateEmail(string $email): ?string {
     $email = trim($email);
-    if ($email === '' || mb_strlen($email, 'UTF-8') > 100) {
-        return 'El correo electrónico es obligatorio y debe tener máximo 100 caracteres.';
+    if ($email === '') {
+        return 'Este campo es obligatorio';
+    }
+    if (mb_strlen($email, 'UTF-8') > 100) {
+        return 'Se superó el máximo de caracteres';
     }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        return 'El formato del correo electrónico no es válido (usuario@dominio.com).';
+        return 'Introduce un correo válido';
     }
     return null;
 }
 
 function validatePassword(string $password): ?string {
-    if (strlen($password) < 8) {
-        return 'La contraseña debe tener al menos 8 caracteres.';
+    if ($password === '') {
+        return 'Este campo es obligatorio';
     }
-    if (preg_match('/\s/', $password)) {
-        return 'La contraseña no puede contener espacios en blanco.';
-    }
-    if (!preg_match('/[A-Z]/', $password) || !preg_match('/[a-z]/', $password) || !preg_match('/[0-9]/', $password)) {
-        return 'La contraseña debe incluir al menos 1 mayúscula, 1 minúscula y 1 número.';
+    $len = mb_strlen($password, 'UTF-8');
+    if ($len < 8 || $len > 10) {
+        return 'La contraseña debe tener de 8 a 10 caracteres';
     }
     return null;
 }
 
-function validateCourseData(string $name, string $code, string $schedule): array {
+function validateCourseData(string $name, string $group, string $description): array {
     $errors = [];
     $name = trim($name);
-    $code = trim($code);
-    $schedule = trim($schedule);
+    $group = trim($group);
+    $description = trim($description);
 
-    $nameLen = mb_strlen($name, 'UTF-8');
-    if ($nameLen < 3 || $nameLen > 80 || !preg_match('/^[\p{L}\p{N}\s]+$/u', $name)) {
-        $errors['name'] = 'El nombre del curso debe tener entre 3 y 80 caracteres alfanuméricos y espacios.';
+    if ($name === '') {
+        $errors['name'] = 'Este campo es obligatorio';
+    } else {
+        $nameLen = mb_strlen($name, 'UTF-8');
+        if ($nameLen > 80) {
+            $errors['name'] = 'Se superó el máximo de caracteres';
+        } elseif ($nameLen < 3 || !preg_match('/^[\p{L}\p{N}\s\-]+$/u', $name)) {
+            $errors['name'] = 'El nombre debe tener entre 3 y 80 caracteres (letras, números, espacios, acentos y guion).';
+        }
     }
 
-    $codeLen = mb_strlen($code, 'UTF-8');
-    if ($codeLen < 2 || $codeLen > 15 || !preg_match('/^[a-zA-Z0-9]+$/', $code)) {
-        $errors['code'] = 'La clave/grupo debe tener entre 2 y 15 caracteres alfanuméricos sin espacios.';
+    if ($group === '') {
+        $errors['group_name'] = 'Este campo es obligatorio';
+    } else {
+        $groupLen = mb_strlen($group, 'UTF-8');
+        if ($groupLen > 10) {
+            $errors['group_name'] = 'Se superó el máximo de caracteres';
+        } elseif ($groupLen < 1 || !preg_match('/^[a-zA-Z0-9\-]+$/', $group)) {
+            $errors['group_name'] = 'El grupo debe tener entre 1 y 10 caracteres alfanuméricos o guion.';
+        }
     }
 
-    $schedLen = mb_strlen($schedule, 'UTF-8');
-    if ($schedLen < 5 || $schedLen > 50) {
-        $errors['schedule'] = 'El horario debe tener entre 5 y 50 caracteres (ej. Lun-Mié 10:00-12:00).';
+    if ($description !== '' && mb_strlen($description, 'UTF-8') > 200) {
+        $errors['description'] = 'Se superó el máximo de caracteres';
     }
 
     return $errors;

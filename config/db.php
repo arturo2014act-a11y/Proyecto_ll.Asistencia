@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+date_default_timezone_set('America/Merida');
+
 define('DB_HOST', '127.0.0.1');
 define('DB_NAME', 'sgap_db');
 define('DB_USER', 'root');
@@ -15,6 +17,7 @@ function getDB(): PDO {
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES => false,
         ]);
+        $pdo->exec("SET time_zone = '-06:00'");
     }
     return $pdo;
 }

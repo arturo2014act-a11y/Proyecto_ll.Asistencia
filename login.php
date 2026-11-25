@@ -1,41 +1,54 @@
 <?php
 declare(strict_types=1);
-require_once __DIR__ . '/config/db.php';
-require_once __DIR__ . '/includes/auth.php';
 
-$redirect = $_GET['redirect'] ?? $_POST['redirect'] ?? '';
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/validators.php';
+require_once __DIR__ . '/../includes/layout.php';
 
 if (isLoggedIn()) {
-    if ($redirect !== '' && str_starts_with($redirect, '/sgap/')) {
-        header('Location: ' . $redirect);
-        exit;
-    }
-    header('Location: /sgap/index.php');
+    $u = currentUser();
+    $target = $u['role'] === 'profesor' ? '/sgap/profesor/dashboard.php' : '/sgap/estudiante/dashboard.php';
+    header('Location: ' . $target);
     exit;
 }
 
-$error = '';
+$errors = [];
+$generalError = '';
 $email = '';
+$redirect = $_GET['redirect'] ?? $_POST['redirect'] ?? '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $email = trim($_POST['email'] ?? '');
-    $password = $_POST['password'] ?? '';
+    $email = trim((string)($_POST['email'] ?? ''));
+    $password = (string)($_POST['password'] ?? '');
 
-    if ($email === '' || $password === '') {
-        $error = 'Correo o contraseña incorrectos';
-    } else {
-        $pdo = getDB();
-        $stmt = $pdo->prepare('SELECT id, full_name, email, password_hash, role FROM users WHERE email = ? LIMIT 1');
+    if ($email === '') {
+        $errors['email'] = 'Este campo es obligatorio';
+    } elseif (($emailErr = validateEmail($email)) !== null) {
+        $errors['email'] = $emailErr;
+    }
+
+    if ($password === '') {
+        $errors['password'] = 'Este campo es obligatorio';
+    }
+
+    if (empty($errors)) {
+        $db = getDB();
+        $stmt = $db->prepare('SELECT id, full_name, email, password_hash, role, control_number, failed_attempts, locked_until FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1');
         $stmt->execute([$email]);
         $user = $stmt->fetch();
 
-        if ($user && password_verify($password, $user['password_hash'])) {
+        if ($user && $user['locked_until'] !== null && strtotime($user['locked_until']) > time()) {
+            $generalError = 'Demasiados intentos. Intenta nuevamente en 5 minutos';
+        } elseif ($user && password_verify($password, $user['password_hash'])) {
+            $db->prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?')->execute([$user['id']]);
             session_regenerate_id(true);
             $_SESSION['user'] = [
                 'id' => (int)$user['id'],
                 'full_name' => $user['full_name'],
                 'email' => $user['email'],
                 'role' => $user['role'],
+                'control_number' => $user['control_number'],
             ];
             if ($redirect !== '' && str_starts_with($redirect, '/sgap/')) {
                 header('Location: ' . $redirect);
@@ -45,46 +58,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: ' . $target);
             exit;
         } else {
-            $error = 'Correo o contraseña incorrectos';
+            if ($user) {
+                $attempts = (int)$user['failed_attempts'] + 1;
+                if ($attempts >= 5) {
+                    $lockedUntil = date('Y-m-d H:i:s', time() + 300);
+                    $db->prepare('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?')->execute([$attempts, $lockedUntil, $user['id']]);
+                    $generalError = 'Demasiados intentos. Intenta nuevamente en 5 minutos';
+                } else {
+                    $db->prepare('UPDATE users SET failed_attempts = ? WHERE id = ?')->execute([$attempts, $user['id']]);
+                    $generalError = 'Correo o contraseña incorrectos';
+                }
+            } else {
+                $generalError = 'Correo o contraseña incorrectos';
+            }
         }
     }
 }
+
+renderHeader('Iniciar sesión');
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iniciar sesión - SGAP</title>
-  <link rel="stylesheet" href="/sgap/assets/css/style.css">
-</head>
-<body>
-  <div class="auth-container">
-    <div class="card">
-      <h1>Iniciar sesión</h1>
-      <p class="muted" style="margin-bottom:1.2rem;">Accede a SGAP con tu correo y contraseña</p>
-      <?php if (isset($_GET['registered'])): ?>
-        <div class="alert alert-success">Cuenta registrada correctamente. Ahora puedes iniciar sesión.</div>
+<div class="card">
+  <h1>Iniciar sesión - SGAP</h1>
+  <?php if ($generalError !== ''): ?>
+    <div class="alert alert-error"><?= e($generalError) ?></div>
+  <?php endif; ?>
+  <form method="POST" action="/sgap/login.php" novalidate>
+    <input type="hidden" name="redirect" value="<?= e($redirect) ?>">
+    <div class="form-group">
+      <label for="email">Correo electrónico <span class="required-mark">*</span></label>
+      <input type="email" id="email" name="email" value="<?= e($email) ?>" maxlength="100" required>
+      <?php if (isset($errors['email'])): ?>
+        <div class="field-error"><?= e($errors['email']) ?></div>
       <?php endif; ?>
-      <?php if ($error !== ''): ?>
-        <div class="alert alert-danger"><?= e($error) ?></div>
-      <?php endif; ?>
-      <form method="POST" novalidate>
-        <input type="hidden" name="redirect" value="<?= e($redirect) ?>">
-        <div class="form-group">
-          <label for="email">Correo electrónico</label>
-          <input type="email" id="email" name="email" class="form-control" value="<?= e($email) ?>" required>
-        </div>
-        <div class="form-group">
-          <label for="password">Contraseña</label>
-          <input type="password" id="password" name="password" class="form-control" required>
-        </div>
-        <button type="submit" class="btn btn-primary" style="width:100%;">Entrar</button>
-      </form>
-      <p class="muted" style="margin-top:1rem; text-align:center;">
-        ¿No tienes cuenta? <a href="/sgap/register.php">Regístrate aquí</a>
-      </p>
     </div>
-  </div>
-</body>
-</html>
+    <div class="form-group">
+      <label for="password">Contraseña <span class="required-mark">*</span></label>
+      <div class="password-wrapper">
+        <input type="password" id="password" name="password" required>
+        <button type="button" class="toggle-password" onclick="const p=document.getElementById('password'); const isP=p.type==='password'; p.type=isP?'text':'password'; this.textContent=isP?'Ocultar':'Mostrar';">Mostrar</button>
+      </div>
+      <?php if (isset($errors['password'])): ?>
+        <div class="field-error"><?= e($errors['password']) ?></div>
+      <?php endif; ?>
+    </div>
+    <button type="submit" class="btn btn-primary" style="width:100%;">Iniciar sesión</button>
+  </form>
+</div>
+<?php renderFooter(); ?>

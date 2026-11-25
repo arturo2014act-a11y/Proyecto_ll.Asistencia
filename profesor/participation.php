@@ -1,131 +1,136 @@
 <?php
 declare(strict_types=1);
+
 require_once __DIR__ . '/../config/db.php';
 require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/layout.php';
 
 requireRole('profesor');
 $user = currentUser();
-$pdo = getDB();
+$db = getDB();
 
-$courseId = (int)($_GET['course_id'] ?? $_POST['course_id'] ?? 0);
-$stmt = $pdo->prepare('SELECT * FROM courses WHERE id = ? AND professor_id = ? LIMIT 1');
-$stmt->execute([$courseId, $user['id']]);
-$course = $stmt->fetch();
-if (!$course) {
-    header('Location: /sgap/profesor/courses.php');
+$sessionId = isset($_GET['session_id']) ? (int)$_GET['session_id'] : (int)($_POST['session_id'] ?? 0);
+
+$sStmt = $db->prepare('
+    SELECT s.*, c.name AS course_name, c.group_name, c.professor_id
+    FROM attendance_sessions s
+    JOIN courses c ON c.id = s.course_id
+    WHERE s.id = ? AND c.professor_id = ?
+');
+$sStmt->execute([$sessionId, $user['id']]);
+$session = $sStmt->fetch();
+
+if (!$session) {
+    renderHeader('Participación', 'cursos');
+    echo '<div class="card"><div class="alert alert-error">No tienes permiso para realizar esta acción</div><a href="/sgap/profesor/courses.php" class="btn btn-primary">Volver a Mis cursos</a></div>';
+    renderFooter();
     exit;
 }
 
-$success = '';
-$error = '';
+$isOpen = $session['status'] === 'abierta';
+$errorMsg = '';
+$successMsg = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-    $studentId = (int)($_POST['student_id'] ?? 0);
-
-    // Verificar que el estudiante esté inscrito
-    $chk = $pdo->prepare('SELECT id FROM enrollments WHERE course_id = ? AND student_id = ? LIMIT 1');
-    $chk->execute([$courseId, $studentId]);
-    if (!$chk->fetch()) {
-        $error = 'Estudiante no inscrito en este curso.';
-    } elseif ($action === 'add') {
-        $obs = trim($_POST['observation'] ?? '');
-        if (mb_strlen($obs, 'UTF-8') > 100) {
-            $error = 'La observación no puede exceder los 100 caracteres.';
+    if (!$isOpen) {
+        $errorMsg = 'La clase ya finalizó';
+    } else {
+        $studentId = (int)($_POST['student_id'] ?? 0);
+        $delta = (int)($_POST['delta'] ?? 0);
+        if (!in_array($delta, [1, -1], true)) {
+            $errorMsg = 'No fue posible guardar los cambios. Intenta nuevamente';
         } else {
-            $ins = $pdo->prepare('INSERT INTO participations (course_id, student_id, participation_date, observation) VALUES (?, ?, ?, ?)');
-            $ins->execute([$courseId, $studentId, date('Y-m-d'), $obs !== '' ? $obs : null]);
-            $success = 'Participación (+1) registrada correctamente.';
-        }
-    } elseif ($action === 'subtract') {
-        // RF-11: nunca menor a 0
-        $del = $pdo->prepare('DELETE FROM participations WHERE course_id = ? AND student_id = ? ORDER BY id DESC LIMIT 1');
-        $del->execute([$courseId, $studentId]);
-        if ($del->rowCount() > 0) {
-            $success = 'Se restó -1 participación correctamente.';
+            $curStmt = $db->prepare('SELECT participation_count FROM attendance_records WHERE session_id = ? AND student_id = ?');
+            $curStmt->execute([$sessionId, $studentId]);
+            $row = $curStmt->fetch();
+            if (!$row) {
+                $errorMsg = 'No fue posible guardar los cambios. Intenta nuevamente';
+            } else {
+                $newVal = (int)$row['participation_count'] + $delta;
+                if ($newVal < 0 || $newVal > 99) {
+                    $errorMsg = 'No se permiten valores fuera de 0 a 99';
+                } else {
+                    $db->prepare('UPDATE attendance_records SET participation_count = ? WHERE session_id = ? AND student_id = ?')
+                       ->execute([$newVal, $sessionId, $studentId]);
+                    $successMsg = 'Participación actualizada. Total confirmado: ' . $newVal;
+                }
+            }
         }
     }
 }
 
-$stuStmt = $pdo->prepare('
-    SELECT u.id, u.full_name, u.email,
-           (SELECT COUNT(*) FROM participations p WHERE p.course_id = ? AND p.student_id = u.id) AS total_part
-    FROM enrollments e
-    JOIN users u ON u.id = e.student_id
-    WHERE e.course_id = ?
+$recStmt = $db->prepare('
+    SELECT r.student_id, r.participation_count, u.full_name, u.control_number
+    FROM attendance_records r
+    JOIN users u ON u.id = r.student_id
+    WHERE r.session_id = ?
     ORDER BY u.full_name ASC
 ');
-$stuStmt->execute([$courseId, $courseId]);
-$students = $stuStmt->fetchAll();
+$recStmt->execute([$sessionId]);
+$records = $recStmt->fetchAll();
+
+renderHeader('Participación', 'cursos');
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Participación - SGAP</title>
-  <link rel="stylesheet" href="/sgap/assets/css/style.css">
-</head>
-<body>
-  <nav class="navbar">
-    <div class="brand">SGAP · Profesor</div>
-    <div class="nav-links">
-      <a href="/sgap/profesor/dashboard.php">Dashboard</a>
-      <a href="/sgap/profesor/courses.php">Cursos</a>
-      <a href="/sgap/logout.php" class="btn btn-secondary btn-sm">Cerrar sesión</a>
-    </div>
-  </nav>
+<h1>Participación — <?= e($session['course_name']) ?> (<?= e($session['group_name']) ?>)</h1>
+<p style="margin-bottom:16px;"><strong>Sesión:</strong> <?= date('d/m/Y H:i', strtotime($session['started_at'])) ?> (<?= $isOpen ? 'Abierta' : 'Cerrada - Solo consulta' ?>)</p>
 
-  <div class="container">
-    <div class="card-header">
-      <h1>Control de Participación: <?= e($course['name']) ?> (<?= e($course['code']) ?>)</h1>
-      <a href="/sgap/profesor/courses.php" class="btn btn-secondary btn-sm">Volver a cursos</a>
-    </div>
+<?php if ($successMsg !== ''): ?>
+  <div class="alert alert-success"><?= e($successMsg) ?></div>
+<?php endif; ?>
+<?php if ($errorMsg !== ''): ?>
+  <div class="alert alert-error"><?= e($errorMsg) ?></div>
+<?php endif; ?>
 
-    <?php if ($error !== ''): ?><div class="alert alert-danger"><?= e($error) ?></div><?php endif; ?>
-    <?php if ($success !== ''): ?><div class="alert alert-success"><?= e($success) ?></div><?php endif; ?>
+<div style="margin-bottom:16px;">
+  <a href="/sgap/profesor/attendance.php?session_id=<?= $sessionId ?>" class="btn btn-secondary">Volver a la clase activa</a>
+</div>
 
-    <div class="card">
-      <?php if (empty($students)): ?>
-        <p class="muted">No hay estudiantes inscritos en este curso.</p>
-      <?php else: ?>
-        <table>
-          <thead>
-            <tr>
-              <th>Estudiante</th>
-              <th>Total Participaciones</th>
-              <th>Observación opcional (máx. 100)</th>
+<div class="card">
+  <h2>Lista de participación (0 a 99)</h2>
+  <?php if (empty($records)): ?>
+    <div class="alert alert-info">Sin registros.</div>
+  <?php else: ?>
+    <div class="table-responsive">
+      <table>
+        <thead>
+          <tr>
+            <th>Número de control</th>
+            <th>Nombre</th>
+            <th>Total confirmado</th>
+            <?php if ($isOpen): ?>
               <th>Acciones</th>
+            <?php endif; ?>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($records as $r): ?>
+            <tr>
+              <td><?= e($r['control_number']) ?></td>
+              <td><?= e($r['full_name']) ?></td>
+              <td><strong><?= (int)$r['participation_count'] ?></strong></td>
+              <?php if ($isOpen): ?>
+                <td>
+                  <div style="display:flex; gap:8px;">
+                    <form method="POST" action="/sgap/profesor/participation.php?session_id=<?= $sessionId ?>" style="margin:0;">
+                      <input type="hidden" name="session_id" value="<?= $sessionId ?>">
+                      <input type="hidden" name="student_id" value="<?= (int)$r['student_id'] ?>">
+                      <input type="hidden" name="delta" value="1">
+                      <button type="submit" class="btn btn-success btn-sm">+1</button>
+                    </form>
+                    <form method="POST" action="/sgap/profesor/participation.php?session_id=<?= $sessionId ?>" style="margin:0;">
+                      <input type="hidden" name="session_id" value="<?= $sessionId ?>">
+                      <input type="hidden" name="student_id" value="<?= (int)$r['student_id'] ?>">
+                      <input type="hidden" name="delta" value="-1">
+                      <button type="submit" class="btn btn-danger btn-sm">-1</button>
+                    </form>
+                  </div>
+                </td>
+              <?php endif; ?>
             </tr>
-          </thead>
-          <tbody>
-            <?php foreach ($students as $s): $total = (int)$s['total_part']; ?>
-              <tr>
-                <td><?= e($s['full_name']) ?></td>
-                <td><strong><?= $total ?></strong></td>
-                <td>
-                  <form method="POST" id="add-form-<?= (int)$s['id'] ?>" class="actions-row">
-                    <input type="hidden" name="action" value="add">
-                    <input type="hidden" name="course_id" value="<?= $courseId ?>">
-                    <input type="hidden" name="student_id" value="<?= (int)$s['id'] ?>">
-                    <input type="text" name="observation" maxlength="100" placeholder="Opcional..." class="form-control" style="max-width:240px;">
-                    <button type="submit" class="btn btn-success btn-sm">+1</button>
-                  </form>
-                </td>
-                <td>
-                  <form method="POST" style="display:inline;">
-                    <input type="hidden" name="action" value="subtract">
-                    <input type="hidden" name="course_id" value="<?= $courseId ?>">
-                    <input type="hidden" name="student_id" value="<?= (int)$s['id'] ?>">
-                    <button type="submit" class="btn btn-danger btn-sm" <?= $total <= 0 ? 'disabled' : '' ?>>-1</button>
-                  </form>
-                </td>
-              </tr>
-            <?php endforeach; ?>
-          </tbody>
-        </table>
-      <?php endif; ?>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
     </div>
-  </div>
-</body>
-</html>
+  <?php endif; ?>
+</div>
+<?php renderFooter(); ?>
